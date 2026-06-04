@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: feishu-todo-bot
+    env: python
+    buildCommand: pip install -r app/requirements.txt
+    startCommand: gunicorn app.main:app --bind 0.0.0.0:$PORT --workers 1 --timeout 60
+    envVars:
+      - key: FEISHU_APP_ID
+        sync: false
+      - key: FEISHU_APP_SECRET
+        sync: false
+      - key: FEISHU_VERIFY_TOKEN
+        sync: false
+      - key: FEISHU_TARGET_OPEN_ID
+        sync: false
+      - key: DB_PATH
+        value: /var/data/todos.db
+    disk:
+      name: todo-data
+      mountPath: /var/data
+      sizeGB: 1
