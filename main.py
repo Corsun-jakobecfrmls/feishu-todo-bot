@@ -1,12 +1,10 @@
 """
-飞书 Todo 机器人后端
-功能：接收消息 → 添加待办 → 每天9点/16点推送提醒 → 支持完成标记
+飞书 Todo 机器人 - 使用飞书多维表格作为数据库
 """
 
 import os
 import json
 import time
-import sqlite3
 import logging
 import schedule
 import threading
@@ -21,91 +19,71 @@ logger = logging.getLogger(__name__)
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 FEISHU_TARGET_OPEN_ID = os.environ.get("FEISHU_TARGET_OPEN_ID", "")
-DB_PATH = os.environ.get("DB_PATH", "/tmp/todos.db")
+BITABLE_APP_TOKEN = os.environ.get("BITABLE_APP_TOKEN", "")
+BITABLE_TABLE_ID = os.environ.get("BITABLE_TABLE_ID", "")
 
-# 启动时初始化数据库
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS todos (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            text      TEXT    NOT NULL,
-            done      INTEGER NOT NULL DEFAULT 0,
-            created   TEXT    NOT NULL,
-            done_time TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-    logger.info(f"数据库初始化完成: {DB_PATH}")
-
-init_db()
-
-def get_todos(done=0):
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        "SELECT id, text, created FROM todos WHERE done=? ORDER BY id DESC",
-        (done,)
-    ).fetchall()
-    conn.close()
-    return rows
-
-def add_todo(text):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "INSERT INTO todos (text, done, created) VALUES (?, 0, ?)",
-        (text, datetime.now().strftime("%Y-%m-%d %H:%M"))
-    )
-    conn.commit()
-    conn.close()
-
-def mark_done_by_keyword(keyword):
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        "SELECT id, text FROM todos WHERE done=0 AND text LIKE ?",
-        (f"%{keyword}%",)
-    ).fetchall()
-    matched = []
-    for row in rows:
-        conn.execute(
-            "UPDATE todos SET done=1, done_time=? WHERE id=?",
-            (datetime.now().strftime("%Y-%m-%d %H:%M"), row[0])
-        )
-        matched.append(row[1])
-    conn.commit()
-    conn.close()
-    return matched
-
-def get_tenant_access_token():
+def get_token():
     url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-    resp = requests.post(url, json={
-        "app_id": FEISHU_APP_ID,
-        "app_secret": FEISHU_APP_SECRET
-    }, timeout=10)
+    resp = requests.post(url, json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}, timeout=10)
     return resp.json().get("tenant_access_token", "")
 
+def bitable_headers():
+    return {"Authorization": f"Bearer {get_token()}", "Content-Type": "application/json"}
+
+def get_todos():
+    """获取所有未完成的待办"""
+    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}/tables/{BITABLE_TABLE_ID}/records"
+    params = {"filter": 'CurrentValue.[状态]!="完成"', "page_size": 100}
+    resp = requests.get(url, headers=bitable_headers(), params=params, timeout=10)
+    data = resp.json()
+    records = data.get("data", {}).get("items", [])
+    result = []
+    for r in records:
+        fields = r.get("fields", {})
+        text = fields.get("任务内容", "")
+        created = fields.get("创建时间", "")
+        record_id = r.get("record_id", "")
+        if text:
+            result.append((record_id, text, created))
+    return result
+
+def add_todo(text):
+    """添加待办"""
+    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}/tables/{BITABLE_TABLE_ID}/records"
+    payload = {"fields": {
+        "任务内容": text,
+        "状态": "待完成",
+        "创建时间": datetime.now().strftime("%Y-%m-%d %H:%M")
+    }}
+    resp = requests.post(url, headers=bitable_headers(), json=payload, timeout=10)
+    logger.info(f"添加待办: {resp.status_code}")
+
+def mark_done(keyword):
+    """模糊匹配关键词，标记完成"""
+    todos = get_todos()
+    matched = []
+    for record_id, text, created in todos:
+        if keyword in text:
+            url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}/tables/{BITABLE_TABLE_ID}/records/{record_id}"
+            requests.put(url, headers=bitable_headers(), json={"fields": {"状态": "完成"}}, timeout=10)
+            matched.append(text)
+    return matched
+
 def send_text(open_id, text):
-    token = get_tenant_access_token()
+    token = get_token()
     url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "receive_id": open_id,
-        "msg_type": "text",
-        "content": json.dumps({"text": text})
-    }
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {"receive_id": open_id, "msg_type": "text", "content": json.dumps({"text": text})}
     resp = requests.post(url, headers=headers, json=payload, timeout=10)
     logger.info(f"发送消息: {resp.status_code}")
 
 def send_todo_reminder(open_id):
-    todos = get_todos(done=0)
+    todos = get_todos()
     if not todos:
         send_text(open_id, "✅ 当前没有待办事项，继续保持！")
         return
     lines = ["📋 待办提醒\n"]
-    for idx, (tid, text, created) in enumerate(todos, 1):
+    for idx, (rid, text, created) in enumerate(todos, 1):
         lines.append(f"{idx}. 〇 {text}  ({created})")
     lines.append("\n💬 回复「完成 关键词」标记完成\n例如：完成 开会")
     send_text(open_id, "\n".join(lines))
@@ -114,12 +92,11 @@ def handle_message(open_id, text):
     text = text.strip()
     logger.info(f"收到消息 [{open_id}]: {text}")
 
-    finish_prefixes = ["完成", "做完", "done", "Done"]
-    for prefix in finish_prefixes:
+    for prefix in ["完成", "做完", "done", "Done"]:
         if text.startswith(prefix):
             keyword = text[len(prefix):].strip()
             if keyword:
-                matched = mark_done_by_keyword(keyword)
+                matched = mark_done(keyword)
                 if matched:
                     reply = "✅ 已完成：\n" + "\n".join(f"  · {t}" for t in matched)
                 else:
@@ -136,7 +113,7 @@ def handle_message(open_id, text):
         return
 
     add_todo(text)
-    count = len(get_todos(done=0))
+    count = len(get_todos())
     send_text(open_id, f"✨ 已添加待办：{text}\n\n当前共有 {count} 项待完成")
 
 def scheduled_remind():
@@ -185,8 +162,7 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
-    todos = get_todos(done=0)
-    return jsonify({"status": "ok", "pending_todos": len(todos)})
+    return jsonify({"status": "ok"})
 
 @app.route("/", methods=["GET"])
 def index():
