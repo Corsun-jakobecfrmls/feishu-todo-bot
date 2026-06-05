@@ -9,7 +9,9 @@ import logging
 import schedule
 import threading
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+CST = timezone(timedelta(hours=8))
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -53,7 +55,7 @@ def add_todo(text):
     payload = {"fields": {
         "任务内容": text,
         "状态": "待完成",
-        "创建时间": datetime.now().strftime("%Y-%m-%d %H:%M")
+        "创建时间": datetime.now(CST).strftime("%Y-%m-%d %H:%M")
     }}
     resp = requests.post(url, headers=bitable_headers(), json=payload, timeout=10)
     logger.info(f"添加待办: {resp.status_code}")
